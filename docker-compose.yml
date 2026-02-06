@@ -1,0 +1,27 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    network_mode: host
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    restart: unless-stopped
+
+  cam-publisher:
+    image: linuxserver/ffmpeg:latest
+    network_mode: host
+    devices:
+      - /dev/video0:/dev/video0
+    depends_on:
+      - mediamtx
+    restart: unless-stopped
+    command: >
+      -hide_banner -loglevel warning
+      -f v4l2
+      -input_format mjpeg
+      -framerate 15
+      -video_size 1280x720
+      -i /dev/video0
+      -an
+      -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p
+      -f rtsp -rtsp_transport tcp
+      rtsp://127.0.0.1:8554/cam

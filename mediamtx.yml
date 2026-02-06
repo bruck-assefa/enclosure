@@ -1,0 +1,19 @@
+logLevel: info
+
+rtsp: yes
+rtspAddress: :8554
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcEncryption: no
+webrtcAllowOrigins: ['*']
+
+api: yes
+apiAddress: :9997
+
+rtmp: no
+hls: no
+srt: no
+
+paths:
+  cam: {}
