@@ -9,28 +9,47 @@ app = FastAPI(title="Bearded Dragon Enclosure API")
 
 # --- Hardware Initialization ---
 i2c = board.I2C()
-tca = adafruit_tca9548a.TCA9548A(i2c)
 
-# Store SENSOR OBJECTS, not just data
+# Initialize BOTH multiplexers
+# 0x70 is the default address, 0x71 is your new one
+tca_1 = adafruit_tca9548a.TCA9548A(i2c, address=0x70)
+tca_2 = adafruit_tca9548a.TCA9548A(i2c, address=0x72)
+
+# Create a list to easily loop through them
+# Format: (mux_object, id_offset)
+# Mux 1 covers IDs 0-7, Mux 2 covers IDs 8-15
+multiplexers = [
+    (tca_1, 0),
+    (tca_2, 8)
+]
+
+# Store SENSOR OBJECTS to avoid re-initializing them constantly
 sensor_objects = {}
 sensor_cache = {}
 
 def init_sensors():
-    """Attempt to connect to all 8 sensors once at startup."""
+    """Attempt to connect to all 16 channels across both muxes."""
     print("Initializing sensors...")
-    for channel in range(8):
-        try:
-            # Try address 0x76 first (common), then 0x77 (Adafruit standard)
-            try:
-                sensor = adafruit_bme280.Adafruit_BME280_I2C(tca[channel], address=0x76)
-            except ValueError:
-                sensor = adafruit_bme280.Adafruit_BME280_I2C(tca[channel], address=0x77)
+    
+    for mux, offset in multiplexers:
+        for channel in range(8):
+            # Calculate a unique global ID (e.g., 0-7 for mux1, 8-15 for mux2)
+            global_id = channel + offset
             
-            sensor_objects[channel] = sensor
-            print(f"Sensor {channel}: CONNECTED")
-        except Exception as e:
-            print(f"Sensor {channel}: FAILED ({e})")
-            sensor_objects[channel] = None
+            try:
+                # Try address 0x76 first, then 0x77
+                try:
+                    sensor = adafruit_bme280.Adafruit_BME280_I2C(mux[channel], address=0x76)
+                except ValueError:
+                    sensor = adafruit_bme280.Adafruit_BME280_I2C(mux[channel], address=0x77)
+                
+                sensor_objects[global_id] = sensor
+                print(f"Sensor {global_id} (Mux {hex(mux.address)} Ch {channel}): CONNECTED")
+                
+            except Exception as e:
+                # If no sensor is found, store None so we know it's empty
+                # print(f"Sensor {global_id}: Not found") # Optional: uncomment to debug
+                sensor_objects[global_id] = None
 
 # --- Models ---
 class SensorReading(BaseModel):
@@ -39,31 +58,38 @@ class SensorReading(BaseModel):
     pressure: float
     status: str
 
-# --- Sensor Polling Logic ---
-# In your original main.py
-
+# -- Sensor Polling Logic --
 def read_all_sensors():
     global sensor_cache
-    for channel in range(8):
-        try:
-            # CHANGE THIS LINE: Add address=0x76
-            sensor = adafruit_bme280.Adafruit_BME280_I2C(tca[channel], address=0x76)
-            
-            sensor_cache[f"sensor_{channel}"] = {
-                "temp": round(sensor.temperature, 2),
-                "humidity": round(sensor.relative_humidity, 2),
-                "pressure": round(sensor.pressure, 2),
-                "status": "online"
-            }
-        except Exception:
-            # This will happen for channels 0, 1, 2, 4, 5, 6, 7 since they are empty
-            sensor_cache[f"sensor_{channel}"] = {
+    
+    # Iterate through all 16 potential sensor slots
+    for global_id in range(16):
+        sensor = sensor_objects.get(global_id)
+        
+        if sensor:
+            try:
+                # We use the EXISTING sensor object rather than creating a new one
+                sensor_cache[f"sensor_{global_id}"] = {
+                    "temp": round(sensor.temperature, 2),
+                    "humidity": round(sensor.relative_humidity, 2),
+                    "pressure": round(sensor.pressure, 2),
+                    "status": "online"
+                }
+            except Exception as e:
+                # If reading fails (sensor disconnected while running)
+                sensor_cache[f"sensor_{global_id}"] = {
+                    "temp": 0, "humidity": 0, "pressure": 0, "status": "error"
+                }
+        else:
+            # If the sensor was never found during init
+            sensor_cache[f"sensor_{global_id}"] = {
                 "temp": 0, "humidity": 0, "pressure": 0, "status": "offline"
             }
 
 async def sensor_poller():
     while True:
-        read_all_sensors()
+        # Run the read function in a thread to avoid blocking the API
+        await asyncio.to_thread(read_all_sensors)
         await asyncio.sleep(5)
 
 @app.on_event("startup")
