@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import board
 import adafruit_tca9548a
@@ -12,7 +13,20 @@ from astral import LocationInfo
 from astral.sun import sun
 from zoneinfo import ZoneInfo
 
-app = FastAPI(title="Bearded Dragon Enclosure API")
+app = FastAPI(
+    title="Bearded Dragon Enclosure API",
+    root_path="/pi"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    # In production, replace "*" with your AWS frontend's specific URL (e.g., ["http://your-aws-ip"])
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 DB_FILE = "enclosure.db"
 
 # --- Hardware Initialization (Sensors) ---
