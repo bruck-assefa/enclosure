@@ -1,5 +1,7 @@
 import asyncio
 import sqlite3
+import logging
+import sys
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +15,15 @@ from astral import LocationInfo
 from astral.sun import sun
 from zoneinfo import ZoneInfo
 
+# --- Logging Setup ---
+# This forces logs to write immediately with timestamps
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
 app = FastAPI(
     title="Bearded Dragon Enclosure API",
     root_path="/pi"
@@ -20,7 +31,6 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    # In production, replace "*" with your AWS frontend's specific URL (e.g., ["http://your-aws-ip"])
     allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
@@ -30,27 +40,30 @@ app.add_middleware(
 DB_FILE = "enclosure.db"
 
 # --- Hardware Initialization (Sensors) ---
-i2c = board.I2C()
+try:
+    logger.info("Initializing I2C Bus...")
+    i2c = board.I2C()
+except Exception as e:
+    logger.error(f"Failed to initialize I2C bus: {e}")
 
 # Initialize BOTH multiplexers
-# 0x70 is the default address, 0x71 is your new one
-tca_1 = adafruit_tca9548a.TCA9548A(i2c, address=0x70)
-tca_2 = adafruit_tca9548a.TCA9548A(i2c, address=0x72)
+try:
+    logger.info("Connecting to Multiplexer at 0x70...")
+    tca_1 = adafruit_tca9548a.TCA9548A(i2c, address=0x70)
+    # logger.info("Connecting to Multiplexer at 0x72...")
+    # tca_2 = adafruit_tca9548a.TCA9548A(i2c, address=0x72)
+except Exception as e:
+    logger.error(f"Failed to find Multiplexer: {e}")
 
-# Create a list to easily loop through them
-# Format: (mux_object, id_offset)
-# Mux 1 covers IDs 0-7, Mux 2 covers IDs 8-15
 multiplexers = [
-    (tca_1, 0),
-    (tca_2, 8)
+    (tca_1, 0)
+    # , (tca_2, 8)
 ]
 
-# Store SENSOR OBJECTS to avoid re-initializing them constantly
 sensor_objects = {}
 sensor_cache = {}
 
 # --- Hardware Initialization (Relays) ---
-# Map Relay IDs to BCM GPIO pins
 RELAY_PINS = {
     '1': 4,
     '2': 22,
@@ -72,44 +85,42 @@ class ScheduleUpdate(BaseModel):
 
 # --- Database & Logging Logic ---
 def init_db():
-    """Initializes SQLite tables and default schedules if they don't exist."""
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        
-        # Create schedules table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS relay_schedules (
-                relay_id TEXT PRIMARY KEY,
-                on_time TEXT,
-                off_time TEXT,
-                mode TEXT DEFAULT 'auto',
-                last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create history log table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS relay_event_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                relay_id TEXT,
-                state TEXT,
-                trigger_source TEXT
-            )
-        """)
-        
-        # Pre-populate default schedules if empty
-        cursor.execute("SELECT COUNT(*) FROM relay_schedules")
-        if cursor.fetchone()[0] == 0:
-            for r_id in RELAY_PINS.keys():
-                cursor.execute(
-                    "INSERT INTO relay_schedules (relay_id, on_time, off_time) VALUES (?, ?, ?)",
-                    (r_id, "07:00", "19:00")
+    logger.info("Initializing Database...")
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS relay_schedules (
+                    relay_id TEXT PRIMARY KEY,
+                    on_time TEXT,
+                    off_time TEXT,
+                    mode TEXT DEFAULT 'auto',
+                    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
-        conn.commit()
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS relay_event_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    relay_id TEXT,
+                    state TEXT,
+                    trigger_source TEXT
+                )
+            """)
+            cursor.execute("SELECT COUNT(*) FROM relay_schedules")
+            if cursor.fetchone()[0] == 0:
+                logger.info("Populating default schedules...")
+                for r_id in RELAY_PINS.keys():
+                    cursor.execute(
+                        "INSERT INTO relay_schedules (relay_id, on_time, off_time) VALUES (?, ?, ?)",
+                        (r_id, "07:00", "19:00")
+                    )
+            conn.commit()
+        logger.info("Database initialization complete.")
+    except Exception as e:
+        logger.error(f"Database Initialization Failed: {e}")
 
 def log_relay_event(relay_id: str, state: str, source: str):
-    """Writes a relay state change to the log table."""
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -119,7 +130,6 @@ def log_relay_event(relay_id: str, state: str, source: str):
         conn.commit()
 
 def update_relay_mode(relay_id: str, mode: str):
-    """Updates the mode (auto/manual) of a relay."""
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -130,22 +140,23 @@ def update_relay_mode(relay_id: str, mode: str):
 
 # --- Sensor Logic ---
 def init_sensors():
-    print("Initializing sensors...")
+    logger.info("Starting sensor scanning sequence...")
     for mux, offset in multiplexers:
         for channel in range(8):
-            # Calculate a unique global ID (e.g., 0-7 for mux1, 8-15 for mux2)
             global_id = channel + offset
+            # Log BEFORE we touch the hardware. If it freezes here, we know exactly which channel killed it.
+            logger.info(f"Attempting to probe Sensor {global_id} on Mux {hex(mux.address)} Channel {channel}...")
             try:
-                # Try address 0x76 first, then 0x77
                 try:
                     sensor = adafruit_bme280.Adafruit_BME280_I2C(mux[channel], address=0x76)
                 except ValueError:
                     sensor = adafruit_bme280.Adafruit_BME280_I2C(mux[channel], address=0x77)
                 
                 sensor_objects[global_id] = sensor
-                print(f"Sensor {global_id} (Mux {hex(mux.address)} Ch {channel}): CONNECTED")
-            except Exception:
+                logger.info(f"-> SUCCESS: Sensor {global_id} connected.")
+            except Exception as e:
                 sensor_objects[global_id] = None
+                logger.warning(f"-> FAILED: No sensor found at ID {global_id} ({e})")
 
 def read_all_sensors():
     global sensor_cache
@@ -159,107 +170,106 @@ def read_all_sensors():
                     "pressure": round(sensor.pressure, 2),
                     "status": "online"
                 }
-            except Exception:
+            except Exception as e:
+                logger.error(f"Hardware read failure on Sensor {global_id}: {e}")
                 sensor_cache[f"sensor_{global_id}"] = {
                     "temp": 0, "humidity": 0, "pressure": 0, "status": "error"
                 }
         else:
-            # If the sensor was never found during init
             sensor_cache[f"sensor_{global_id}"] = {
                 "temp": 0, "humidity": 0, "pressure": 0, "status": "offline"
             }
 
 async def sensor_poller():
+    logger.info("Background sensor poller started.")
     while True:
-        # Run the read function in a thread to avoid blocking the API
         await asyncio.to_thread(read_all_sensors)
         await asyncio.sleep(5)
 
 # --- Scheduler Logic ---
 def sync_sun_times():
-    """Calculates sunrise/sunset and updates schedules (Runs daily)."""
-    # Coordinates for McNair, VA
-    city = LocationInfo("McNair", "Virginia", "US", 38.93, -77.40)
-    local_tz = ZoneInfo("America/New_York")
-    
-    s = sun(city.observer, date=datetime.now(local_tz), tzinfo=local_tz)
-    
-    sunrise_str = s['sunrise'].strftime("%H:%M")
-    sunset_str = s['sunset'].strftime("%H:%M")
-    
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        # Example: Automatically sync Relays 1 and 2 to the sun.
-        for relay_id in ['1', '2']:
-            cursor.execute("""
-                UPDATE relay_schedules 
-                SET on_time = ?, off_time = ?, mode = 'auto', last_updated = CURRENT_TIMESTAMP
-                WHERE relay_id = ?
-            """, (sunrise_str, sunset_str, relay_id))
-        conn.commit()
-    print(f"Sun sync complete. Sunrise: {sunrise_str}, Sunset: {sunset_str}")
+    try:
+        city = LocationInfo("McNair", "Virginia", "US", 38.93, -77.40)
+        local_tz = ZoneInfo("America/New_York")
+        s = sun(city.observer, date=datetime.now(local_tz), tzinfo=local_tz)
+        
+        sunrise_str = s['sunrise'].strftime("%H:%M")
+        sunset_str = s['sunset'].strftime("%H:%M")
+        
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            for relay_id in ['1', '2', '4', '3']:
+                cursor.execute("""
+                    UPDATE relay_schedules 
+                    SET on_time = ?, off_time = ?, mode = 'auto', last_updated = CURRENT_TIMESTAMP
+                    WHERE relay_id = ?
+                """, (sunrise_str, sunset_str, relay_id))
+            conn.commit()
+        logger.info(f"Sun sync complete. Sunrise: {sunrise_str}, Sunset: {sunset_str}")
+    except Exception as e:
+        logger.error(f"Failed to sync sun times: {e}")
 
 def check_schedules():
-    """Checks current time against database schedules (Runs every minute)."""
     now_str = datetime.now().strftime("%H:%M")
-    
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT relay_id, on_time, off_time FROM relay_schedules WHERE mode='auto'")
-        schedules = cursor.fetchall()
-        
-    for relay_id, on_time, off_time in schedules:
-        if relay_id not in RELAY_PINS:
-            continue
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT relay_id, on_time, off_time FROM relay_schedules WHERE mode='auto'")
+            schedules = cursor.fetchall()
             
-        pin = RELAY_PINS[relay_id]
-        current_state_bool = GPIO.input(pin)
-        is_currently_on = (current_state_bool == GPIO.LOW)
-        
-        # Trigger ON
-        if now_str == on_time and not is_currently_on:
-            GPIO.output(pin, GPIO.LOW)
-            log_relay_event(relay_id, "on", "scheduler")
-            print(f"Scheduler turned ON relay {relay_id}")
+        for relay_id, on_time, off_time in schedules:
+            if relay_id not in RELAY_PINS:
+                continue
+                
+            pin = RELAY_PINS[relay_id]
+            current_state_bool = GPIO.input(pin)
+            is_currently_on = (current_state_bool == GPIO.LOW)
             
-        # Trigger OFF
-        elif now_str == off_time and is_currently_on:
-            GPIO.output(pin, GPIO.HIGH)
-            log_relay_event(relay_id, "off", "scheduler")
-            print(f"Scheduler turned OFF relay {relay_id}")
+            if now_str == on_time and not is_currently_on:
+                GPIO.output(pin, GPIO.LOW)
+                log_relay_event(relay_id, "on", "scheduler")
+                logger.info(f"Scheduler turned ON relay {relay_id}")
+                
+            elif now_str == off_time and is_currently_on:
+                GPIO.output(pin, GPIO.HIGH)
+                log_relay_event(relay_id, "off", "scheduler")
+                logger.info(f"Scheduler turned OFF relay {relay_id}")
+    except Exception as e:
+        logger.error(f"Scheduler check failed: {e}")
 
 # --- Lifecycle Events ---
 scheduler = AsyncIOScheduler()
 
 @app.on_event("startup")
 async def startup_event():
-    # 1. Setup Database
+    logger.info("=== APPLICATION STARTUP SEQUENCE INITIATED ===")
+    
     init_db()
-
-    # 2. Setup Sensors
+    
     init_sensors()
     asyncio.create_task(sensor_poller())
 
-    # 3. Setup Relays
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-    for pin in RELAY_PINS.values():
-        GPIO.setup(pin, GPIO.OUT, initial=GPIO.HIGH)
-    print("Relay GPIOs initialized.")
+    logger.info("Initializing GPIO Relays...")
+    try:
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        for pin in RELAY_PINS.values():
+            GPIO.setup(pin, GPIO.OUT, initial=GPIO.HIGH)
+        logger.info("Relay GPIOs initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize GPIO: {e}")
 
-    # 4. Setup Background Scheduler
-    # Check times every minute
+    logger.info("Starting background tasks...")
     scheduler.add_job(check_schedules, 'cron', minute='*')
-    # Update sun times daily at 00:05
     scheduler.add_job(sync_sun_times, 'cron', hour=0, minute=5)
     scheduler.start()
     
-    # Run a sun sync immediately on boot so times are accurate today
-    sync_sun_times() 
+    sync_sun_times()
+    logger.info("=== APPLICATION STARTUP COMPLETE ===")
 
 @app.on_event("shutdown")
 def shutdown_event():
-    print("Cleaning up GPIO and Scheduler...")
+    logger.info("Cleaning up GPIO and Scheduler...")
     scheduler.shutdown()
     GPIO.cleanup()
 
@@ -276,69 +286,80 @@ def get_sensor(sensor_id: str):
 @app.get("/relays")
 def get_relay_status():
     status = {}
-    for relay_id, pin in RELAY_PINS.items():
-        # GPIO.input returns 0 (LOW) or 1 (HIGH)
-        # Remember: Active LOW means LOW is ON
-        state_bool = GPIO.input(pin)
-        status[relay_id] = "on" if state_bool == GPIO.LOW else "off"
+    try:
+        for relay_id, pin in RELAY_PINS.items():
+            state_bool = GPIO.input(pin)
+            status[relay_id] = "on" if state_bool == GPIO.LOW else "off"
+    except Exception as e:
+        logger.error(f"Failed to read relay status: {e}")
     return status
-
-# REMOVE: class RelayPayload(BaseModel)... you don't need it anymore
 
 @app.post("/relays/{relay_id}/{state}")
 def control_relay(relay_id: str, state: str):
     if relay_id not in RELAY_PINS:
         raise HTTPException(status_code=404, detail="Relay ID not found")
     
-    # Normalize input
     action = state.lower()
     pin = RELAY_PINS[relay_id]
 
-    if action == "on":
-        GPIO.output(pin, GPIO.LOW)  # Active LOW logic
-    elif action == "off":
-        GPIO.output(pin, GPIO.HIGH)
-    else:
-        raise HTTPException(status_code=400, detail="State must be 'on' or 'off'")
+    try:
+        if action == "on":
+            GPIO.output(pin, GPIO.LOW)
+        elif action == "off":
+            GPIO.output(pin, GPIO.HIGH)
+        else:
+            raise HTTPException(status_code=400, detail="State must be 'on' or 'off'")
 
-    # Log the manual override and switch that relay to manual mode
-    log_relay_event(relay_id, action, "manual_ui")
-    update_relay_mode(relay_id, "manual")
-
-    return {"relay_id": relay_id, "state": action, "status": "success", "mode": "manual"}
+        log_relay_event(relay_id, action, "manual_ui")
+        update_relay_mode(relay_id, "manual")
+        logger.info(f"Manual Override: Relay {relay_id} turned {action.upper()}")
+        
+        return {"relay_id": relay_id, "state": action, "status": "success", "mode": "manual"}
+    except Exception as e:
+        logger.error(f"Failed to trigger relay {relay_id}: {e}")
+        raise HTTPException(status_code=500, detail="Hardware toggle failed")
 
 # --- Database Endpoints (Schedules & Logs) ---
 @app.get("/schedules")
 def get_schedules():
-    """Retrieve all current schedules."""
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM relay_schedules")
-        return [dict(row) for row in cursor.fetchall()]
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM relay_schedules")
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Failed to fetch schedules: {e}")
+        return []
 
 @app.put("/schedules/{relay_id}")
 def update_schedule(relay_id: str, payload: ScheduleUpdate):
-    """Manually update the schedule for a specific relay from the UI."""
     if relay_id not in RELAY_PINS:
         raise HTTPException(status_code=404, detail="Relay ID not found")
         
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE relay_schedules 
-            SET on_time = ?, off_time = ?, mode = ?, last_updated = CURRENT_TIMESTAMP
-            WHERE relay_id = ?
-        """, (payload.on_time, payload.off_time, payload.mode, relay_id))
-        conn.commit()
-    
-    return {"message": f"Schedule for Relay {relay_id} updated successfully"}
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE relay_schedules 
+                SET on_time = ?, off_time = ?, mode = ?, last_updated = CURRENT_TIMESTAMP
+                WHERE relay_id = ?
+            """, (payload.on_time, payload.off_time, payload.mode, relay_id))
+            conn.commit()
+        logger.info(f"Schedule updated for Relay {relay_id}: ON at {payload.on_time}, OFF at {payload.off_time}")
+        return {"message": f"Schedule for Relay {relay_id} updated successfully"}
+    except Exception as e:
+        logger.error(f"Failed to update schedule: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
 
 @app.get("/logs")
 def get_logs(limit: int = 50):
-    """Retrieve the most recent relay events."""
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM relay_event_logs ORDER BY timestamp DESC LIMIT ?", (limit,))
-        return [dict(row) for row in cursor.fetchall()]
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM relay_event_logs ORDER BY timestamp DESC LIMIT ?", (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Failed to fetch logs: {e}")
+        return []
