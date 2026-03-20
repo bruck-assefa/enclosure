@@ -50,14 +50,14 @@ except Exception as e:
 try:
     logger.info("Connecting to Multiplexer at 0x70...")
     tca_1 = adafruit_tca9548a.TCA9548A(i2c, address=0x70)
-    # logger.info("Connecting to Multiplexer at 0x72...")
-    # tca_2 = adafruit_tca9548a.TCA9548A(i2c, address=0x72)
+    logger.info("Connecting to Multiplexer at 0x72...")
+    tca_2 = adafruit_tca9548a.TCA9548A(i2c, address=0x72)
 except Exception as e:
     logger.error(f"Failed to find Multiplexer: {e}")
 
 multiplexers = [
-    (tca_1, 0)
-    # , (tca_2, 8)
+    (tca_1, 0),
+    (tca_2, 8)
 ]
 
 sensor_objects = {}
@@ -214,7 +214,8 @@ def check_schedules():
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT relay_id, on_time, off_time FROM relay_schedules WHERE mode='auto'")
+            # Grab all schedules, completely ignoring the 'mode' column
+            cursor.execute("SELECT relay_id, on_time, off_time FROM relay_schedules")
             schedules = cursor.fetchall()
             
         for relay_id, on_time, off_time in schedules:
@@ -225,15 +226,25 @@ def check_schedules():
             current_state_bool = GPIO.input(pin)
             is_currently_on = (current_state_bool == GPIO.LOW)
             
-            if now_str == on_time and not is_currently_on:
+            # Determine if the schedule dictates the light SHOULD be ON right now
+            if on_time < off_time:
+                # Normal day schedule (e.g., ON at 07:00, OFF at 19:00)
+                should_be_on = on_time <= now_str < off_time
+            else:
+                # Night schedule crossing midnight (e.g., ON at 20:00, OFF at 06:00)
+                should_be_on = now_str >= on_time or now_str < off_time
+            
+            # Enforce the schedule if the physical hardware is currently wrong
+            if should_be_on and not is_currently_on:
                 GPIO.output(pin, GPIO.LOW)
-                log_relay_event(relay_id, "on", "scheduler")
-                logger.info(f"Scheduler turned ON relay {relay_id}")
+                log_relay_event(relay_id, "on", "scheduler_correction")
+                logger.info(f"Scheduler corrected Relay {relay_id} to ON (Matches Schedule)")
                 
-            elif now_str == off_time and is_currently_on:
+            elif not should_be_on and is_currently_on:
                 GPIO.output(pin, GPIO.HIGH)
-                log_relay_event(relay_id, "off", "scheduler")
-                logger.info(f"Scheduler turned OFF relay {relay_id}")
+                log_relay_event(relay_id, "off", "scheduler_correction")
+                logger.info(f"Scheduler corrected Relay {relay_id} to OFF (Matches Schedule)")
+                
     except Exception as e:
         logger.error(f"Scheduler check failed: {e}")
 
@@ -310,11 +321,11 @@ def control_relay(relay_id: str, state: str):
         else:
             raise HTTPException(status_code=400, detail="State must be 'on' or 'off'")
 
-        log_relay_event(relay_id, action, "manual_ui")
-        update_relay_mode(relay_id, "manual")
-        logger.info(f"Manual Override: Relay {relay_id} turned {action.upper()}")
+        # Log the click as a momentary test, and DO NOT update the database mode
+        log_relay_event(relay_id, action, "manual_test")
+        logger.info(f"Momentary Test: Relay {relay_id} turned {action.upper()}")
         
-        return {"relay_id": relay_id, "state": action, "status": "success", "mode": "manual"}
+        return {"relay_id": relay_id, "state": action, "status": "success", "mode": "auto"}
     except Exception as e:
         logger.error(f"Failed to trigger relay {relay_id}: {e}")
         raise HTTPException(status_code=500, detail="Hardware toggle failed")
