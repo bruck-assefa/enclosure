@@ -305,6 +305,41 @@ def get_relay_status():
         logger.error(f"Failed to read relay status: {e}")
     return status
 
+@app.get("/system/scan")
+def live_hardware_scan():
+    """
+    Performs a raw, lightning-fast I2C ping across all channels.
+    Bypasses the BME280 library entirely and ignores the cache.
+    """
+    live_status = {}
+    for mux, offset in multiplexers:
+        for channel_idx in range(8):
+            global_id = channel_idx + offset
+            try:
+                channel = mux[channel_idx]
+                
+                # Lock the bus momentarily to prevent data collisions
+                if channel.try_lock():
+                    try:
+                        # scan() returns a list of integer addresses that answered the ping
+                        addresses = channel.scan()
+                        
+                        # 0x76 is 118, 0x77 is 119 in decimal
+                        if 0x76 in addresses or 0x77 in addresses:
+                            live_status[f"sensor_{global_id}"] = "online"
+                        else:
+                            live_status[f"sensor_{global_id}"] = "offline"
+                    finally:
+                        channel.unlock()
+                else:
+                    live_status[f"sensor_{global_id}"] = "bus_locked"
+                    
+            except Exception as e:
+                logger.error(f"Live scan failed on channel {global_id}: {e}")
+                live_status[f"sensor_{global_id}"] = "error"
+                
+    return live_status    
+
 @app.post("/relays/{relay_id}/{state}")
 def control_relay(relay_id: str, state: str):
     if relay_id not in RELAY_PINS:
