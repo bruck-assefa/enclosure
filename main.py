@@ -6,9 +6,7 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import board
-import adafruit_tca9548a
-from adafruit_bme280 import basic as adafruit_bme280
+from sensor_collector import configured_collector
 import RPi.GPIO as GPIO
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from astral import LocationInfo
@@ -39,29 +37,8 @@ app.add_middleware(
 
 DB_FILE = "enclosure.db"
 
-# --- Hardware Initialization (Sensors) ---
-try:
-    logger.info("Initializing I2C Bus...")
-    i2c = board.I2C()
-except Exception as e:
-    logger.error(f"Failed to initialize I2C bus: {e}")
-
-# Initialize BOTH multiplexers
-try:
-    logger.info("Connecting to Multiplexer at 0x70...")
-    tca_1 = adafruit_tca9548a.TCA9548A(i2c, address=0x70)
-    logger.info("Connecting to Multiplexer at 0x72...")
-    tca_2 = adafruit_tca9548a.TCA9548A(i2c, address=0x72)
-except Exception as e:
-    logger.error(f"Failed to find Multiplexer: {e}")
-
-multiplexers = [
-    (tca_1, 0),
-    (tca_2, 8)
-]
-
-sensor_objects = {}
-sensor_cache = {}
+# Hardware collection is supervised separately from HTTP requests.
+sensors = configured_collector()
 
 # --- Hardware Initialization (Relays) ---
 RELAY_PINS = {
@@ -138,54 +115,6 @@ def update_relay_mode(relay_id: str, mode: str):
         )
         conn.commit()
 
-# --- Sensor Logic ---
-def init_sensors():
-    logger.info("Starting sensor scanning sequence...")
-    for mux, offset in multiplexers:
-        for channel in range(8):
-            global_id = channel + offset
-            # Log BEFORE we touch the hardware. If it freezes here, we know exactly which channel killed it.
-            logger.info(f"Attempting to probe Sensor {global_id} on Mux {hex(mux.address)} Channel {channel}...")
-            try:
-                try:
-                    sensor = adafruit_bme280.Adafruit_BME280_I2C(mux[channel], address=0x76)
-                except ValueError:
-                    sensor = adafruit_bme280.Adafruit_BME280_I2C(mux[channel], address=0x77)
-                
-                sensor_objects[global_id] = sensor
-                logger.info(f"-> SUCCESS: Sensor {global_id} connected.")
-            except Exception as e:
-                sensor_objects[global_id] = None
-                logger.warning(f"-> FAILED: No sensor found at ID {global_id} ({e})")
-
-def read_all_sensors():
-    global sensor_cache
-    for global_id in range(16):
-        sensor = sensor_objects.get(global_id)
-        if sensor:
-            try:
-                sensor_cache[f"sensor_{global_id}"] = {
-                    "temp": round(sensor.temperature, 2),
-                    "humidity": round(sensor.relative_humidity, 2),
-                    "pressure": round(sensor.pressure, 2),
-                    "status": "online"
-                }
-            except Exception as e:
-                logger.error(f"Hardware read failure on Sensor {global_id}: {e}")
-                sensor_cache[f"sensor_{global_id}"] = {
-                    "temp": 0, "humidity": 0, "pressure": 0, "status": "error"
-                }
-        else:
-            sensor_cache[f"sensor_{global_id}"] = {
-                "temp": 0, "humidity": 0, "pressure": 0, "status": "offline"
-            }
-
-async def sensor_poller():
-    logger.info("Background sensor poller started.")
-    while True:
-        await asyncio.to_thread(read_all_sensors)
-        await asyncio.sleep(5)
-
 # --- Scheduler Logic ---
 def sync_sun_times():
     try:
@@ -257,8 +186,7 @@ async def startup_event():
     
     init_db()
     
-    init_sensors()
-    asyncio.create_task(sensor_poller())
+    await sensors.start()
 
     logger.info("Initializing GPIO Relays...")
     try:
@@ -279,19 +207,41 @@ async def startup_event():
     logger.info("=== APPLICATION STARTUP COMPLETE ===")
 
 @app.on_event("shutdown")
-def shutdown_event():
+async def shutdown_event():
     logger.info("Cleaning up GPIO and Scheduler...")
+    await sensors.stop()
     scheduler.shutdown()
     GPIO.cleanup()
 
 # --- Sensor Endpoints ---
+@app.get("/v1/sensors")
+async def sensor_snapshot():
+    return sensors.snapshot()
+
+
+def legacy_sensors():
+    # Compatibility endpoint: failed values are null, never fabricated zeroes.
+    result = {}
+    for sensor in sensors.snapshot()["sensors"]:
+        reading = sensor["last_good_reading"] or {}
+        status = {"healthy": "online", "disabled": "offline", "unavailable": "offline"}.get(
+            sensor["status"], "error")
+        result[sensor["sensor_id"]] = {
+            "temp": reading.get("temperature_c"), "humidity": reading.get("humidity_pct"),
+            "pressure": reading.get("pressure_hpa"), "status": status,
+            "health": sensor["status"], "last_success_at": sensor["last_success_at"]}
+    return result
+
+
 @app.get("/sensors")
-def get_all_sensors():
-    return sensor_cache
+async def get_all_sensors():
+    return legacy_sensors()
+
 
 @app.get("/sensors/{sensor_id}")
-def get_sensor(sensor_id: str):
-    return sensor_cache.get(sensor_id, {"status": "unknown"})
+async def get_sensor(sensor_id: str):
+    return legacy_sensors().get(sensor_id, {"status": "unknown"})
+
 
 # --- Relay Status & Control Endpoints ---
 @app.get("/relays")
@@ -306,39 +256,10 @@ def get_relay_status():
     return status
 
 @app.get("/system/scan")
-def live_hardware_scan():
-    """
-    Performs a raw, lightning-fast I2C ping across all channels.
-    Bypasses the BME280 library entirely and ignores the cache.
-    """
-    live_status = {}
-    for mux, offset in multiplexers:
-        for channel_idx in range(8):
-            global_id = channel_idx + offset
-            try:
-                channel = mux[channel_idx]
-                
-                # Lock the bus momentarily to prevent data collisions
-                if channel.try_lock():
-                    try:
-                        # scan() returns a list of integer addresses that answered the ping
-                        addresses = channel.scan()
-                        
-                        # 0x76 is 118, 0x77 is 119 in decimal
-                        if 0x76 in addresses or 0x77 in addresses:
-                            live_status[f"sensor_{global_id}"] = "online"
-                        else:
-                            live_status[f"sensor_{global_id}"] = "offline"
-                    finally:
-                        channel.unlock()
-                else:
-                    live_status[f"sensor_{global_id}"] = "bus_locked"
-                    
-            except Exception as e:
-                logger.error(f"Live scan failed on channel {global_id}: {e}")
-                live_status[f"sensor_{global_id}"] = "error"
-                
-    return live_status    
+async def cached_hardware_health():
+    """Compatibility health map. Does not probe or acquire the I2C bus."""
+    return {sid: value["status"] for sid, value in legacy_sensors().items()}
+
 
 @app.post("/relays/{relay_id}/{state}")
 def control_relay(relay_id: str, state: str):
