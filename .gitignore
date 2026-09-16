@@ -10,3 +10,7 @@ logs/
 # System / OS
 .DS_Store
 .env
+# Runtime database: retained on disk, never deployed from Git
+/enclosure.db
+/enclosure.db-*
+/.test-venv/
