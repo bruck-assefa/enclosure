@@ -1,3 +1,4 @@
+from contextlib import closing
 import asyncio
 import sqlite3
 import logging
@@ -9,9 +10,7 @@ from pydantic import BaseModel
 from sensor_collector import configured_collector
 import RPi.GPIO as GPIO
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from astral import LocationInfo
-from astral.sun import sun
-from zoneinfo import ZoneInfo
+import relay_settings
 
 # --- Logging Setup ---
 # This forces logs to write immediately with timestamps
@@ -56,15 +55,16 @@ class SensorReading(BaseModel):
     status: str
 
 class ScheduleUpdate(BaseModel):
-    on_time: str
-    off_time: str
+    on_time: str = ''
+    off_time: str = ''
     mode: str
+    name: str | None = None
 
 # --- Database & Logging Logic ---
 def init_db():
     logger.info("Initializing Database...")
     try:
-        with sqlite3.connect(DB_FILE) as conn:
+        with closing(sqlite3.connect(DB_FILE)) as conn, conn:
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS relay_schedules (
@@ -93,12 +93,14 @@ def init_db():
                         (r_id, "07:00", "19:00")
                     )
             conn.commit()
+        relay_settings.migrate(DB_FILE)
         logger.info("Database initialization complete.")
     except Exception as e:
         logger.error(f"Database Initialization Failed: {e}")
+        raise
 
 def log_relay_event(relay_id: str, state: str, source: str):
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO relay_event_logs (relay_id, state, trigger_source) VALUES (?, ?, ?)",
@@ -107,7 +109,7 @@ def log_relay_event(relay_id: str, state: str, source: str):
         conn.commit()
 
 def update_relay_mode(relay_id: str, mode: str):
-    with sqlite3.connect(DB_FILE) as conn:
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE relay_schedules SET mode = ?, last_updated = CURRENT_TIMESTAMP WHERE relay_id = ?",
@@ -118,32 +120,17 @@ def update_relay_mode(relay_id: str, mode: str):
 # --- Scheduler Logic ---
 def sync_sun_times():
     try:
-        city = LocationInfo("McNair", "Virginia", "US", 38.93, -77.40)
-        local_tz = ZoneInfo("America/New_York")
-        s = sun(city.observer, date=datetime.now(local_tz), tzinfo=local_tz)
-        
-        sunrise_str = s['sunrise'].strftime("%H:%M")
-        sunset_str = s['sunset'].strftime("%H:%M")
-        
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            for relay_id in ['1', '2', '4', '3']:
-                cursor.execute("""
-                    UPDATE relay_schedules 
-                    SET on_time = ?, off_time = ?, mode = 'auto', last_updated = CURRENT_TIMESTAMP
-                    WHERE relay_id = ?
-                """, (sunrise_str, sunset_str, relay_id))
-            conn.commit()
-        logger.info(f"Sun sync complete. Sunrise: {sunrise_str}, Sunset: {sunset_str}")
-    except Exception as e:
-        logger.error(f"Failed to sync sun times: {e}")
+        relay_settings.sync_solar(DB_FILE)
+    except Exception:
+        logger.exception('Solar schedule sync failed')
+
 
 def check_schedules():
-    now_str = datetime.now().strftime("%H:%M")
+    now_str = datetime.now(relay_settings.ZONE).strftime("%H:%M")
     try:
-        with sqlite3.connect(DB_FILE) as conn:
+        with closing(sqlite3.connect(DB_FILE)) as conn, conn:
             cursor = conn.cursor()
-            # Grab all schedules, completely ignoring the 'mode' column
+            # Solar sync resolves sun rows; custom rows retain their saved times.
             cursor.execute("SELECT relay_id, on_time, off_time FROM relay_schedules")
             schedules = cursor.fetchall()
             
@@ -155,14 +142,8 @@ def check_schedules():
             current_state_bool = GPIO.input(pin)
             is_currently_on = (current_state_bool == GPIO.LOW)
             
-            # Determine if the schedule dictates the light SHOULD be ON right now
-            if on_time < off_time:
-                # Normal day schedule (e.g., ON at 07:00, OFF at 19:00)
-                should_be_on = on_time <= now_str < off_time
-            else:
-                # Night schedule crossing midnight (e.g., ON at 20:00, OFF at 06:00)
-                should_be_on = now_str >= on_time or now_str < off_time
-            
+            should_be_on = relay_settings.is_on(on_time, off_time, now_str)
+
             # Enforce the schedule if the physical hardware is currently wrong
             if should_be_on and not is_currently_on:
                 GPIO.output(pin, GPIO.LOW)
@@ -178,7 +159,7 @@ def check_schedules():
         logger.error(f"Scheduler check failed: {e}")
 
 # --- Lifecycle Events ---
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone=relay_settings.ZONE)
 
 @app.on_event("startup")
 async def startup_event():
@@ -200,10 +181,11 @@ async def startup_event():
 
     logger.info("Starting background tasks...")
     scheduler.add_job(check_schedules, 'cron', minute='*')
-    scheduler.add_job(sync_sun_times, 'cron', hour=0, minute=5)
+    scheduler.add_job(sync_sun_times, 'cron', hour=0, minute=0)
     scheduler.start()
     
     sync_sun_times()
+    check_schedules()
     logger.info("=== APPLICATION STARTUP COMPLETE ===")
 
 @app.on_event("shutdown")
@@ -290,7 +272,7 @@ def control_relay(relay_id: str, state: str):
 @app.get("/schedules")
 def get_schedules():
     try:
-        with sqlite3.connect(DB_FILE) as conn:
+        with closing(sqlite3.connect(DB_FILE)) as conn, conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM relay_schedules")
@@ -301,28 +283,21 @@ def get_schedules():
 
 @app.put("/schedules/{relay_id}")
 def update_schedule(relay_id: str, payload: ScheduleUpdate):
-    if relay_id not in RELAY_PINS:
-        raise HTTPException(status_code=404, detail="Relay ID not found")
-        
     try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE relay_schedules 
-                SET on_time = ?, off_time = ?, mode = ?, last_updated = CURRENT_TIMESTAMP
-                WHERE relay_id = ?
-            """, (payload.on_time, payload.off_time, payload.mode, relay_id))
-            conn.commit()
-        logger.info(f"Schedule updated for Relay {relay_id}: ON at {payload.on_time}, OFF at {payload.off_time}")
-        return {"message": f"Schedule for Relay {relay_id} updated successfully"}
-    except Exception as e:
-        logger.error(f"Failed to update schedule: {e}")
-        raise HTTPException(status_code=500, detail="Database error")
+        return relay_settings.save(DB_FILE, relay_id, payload.model_dump())
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
+@app.get('/daylight')
+def get_daylight():
+    return relay_settings.daylight()
+
 
 @app.get("/logs")
 def get_logs(limit: int = 50):
     try:
-        with sqlite3.connect(DB_FILE) as conn:
+        with closing(sqlite3.connect(DB_FILE)) as conn, conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM relay_event_logs ORDER BY timestamp DESC LIMIT ?", (limit,))
