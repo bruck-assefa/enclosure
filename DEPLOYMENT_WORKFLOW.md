@@ -69,3 +69,12 @@ configuration, and activating services as appropriate. Preserve database events.
 Prefer a new revert commit in Git for source rollback; do not rewrite shared history.
 Never pull blindly over a dirty production checkout, discard all changes, run
 git clean, force-push or hard-reset a server.
+
+## Shared timing settings
+
+Timing settings are maintained in the AWS repository at
+`home/admin/smart-enclosure-api/timing.json`. Follow its `docs/TIMING.md`
+for generation, validation, and coordinated AWS/Pi/frontend activation. Run
+`python3 tools/sync_timing.py --check` from the AWS source repository before
+releasing timing changes; include the generated `timing_config.py` in each
+Python deployment.

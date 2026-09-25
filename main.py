@@ -1,3 +1,4 @@
+import timing_config as timing
 from contextlib import closing
 import asyncio
 import sqlite3
@@ -180,7 +181,7 @@ async def startup_event():
         logger.error(f"Failed to initialize GPIO: {e}")
 
     logger.info("Starting background tasks...")
-    scheduler.add_job(check_schedules, 'cron', minute='*')
+    scheduler.add_job(check_schedules, 'interval', seconds=timing.RELAY_SCHEDULE_CHECK_INTERVAL)
     scheduler.add_job(sync_sun_times, 'cron', hour=0, minute=0)
     scheduler.start()
     

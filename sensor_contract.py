@@ -1,10 +1,11 @@
 """Version 1 sensor contract. Canonical copy: Pi repository; vendored on AWS."""
+import timing_config as timing
 import copy
 import math
 import time
 
 VERSION = 1
-STALE_AFTER = 30
+STALE_AFTER = timing.SENSOR_STALE_AFTER
 FIELDS = ("temperature_c", "humidity_pct", "pressure_hpa")
 
 

@@ -1,4 +1,6 @@
 """Async supervisor; HTTP handlers only read the snapshot."""
+import timing_config as timing
+import math
 import asyncio
 import json
 import logging
@@ -12,7 +14,7 @@ log = logging.getLogger(__name__)
 
 
 class SensorCollector:
-    def __init__(self, items=None, timeout=3, interval=5, target=worker):
+    def __init__(self, items=None, timeout=timing.SENSOR_READ_TIMEOUT, interval=timing.SENSOR_READ_INTERVAL, target=worker):
         self.state = new_snapshot(items=items)
         self.timeout, self.interval, self.target = timeout, interval, target
         self.process = self.pipe = self.task = None
@@ -44,14 +46,14 @@ class SensorCollector:
             return True
         if self.process.is_alive():
             self.process.terminate()
-        deadline = time.monotonic() + 0.5
+        deadline = time.monotonic() + timing.SENSOR_WORKER_STOP_TIMEOUT
         while self.process.is_alive() and time.monotonic() < deadline:
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(timing.SENSOR_WORKER_POLL)
         if self.process.is_alive():
             self.process.kill()
-            deadline = time.monotonic() + 0.5
+            deadline = time.monotonic() + timing.SENSOR_WORKER_STOP_TIMEOUT
             while self.process.is_alive() and time.monotonic() < deadline:
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(timing.SENSOR_WORKER_POLL)
         if self.process.is_alive():
             # Never start another bus owner while a kernel-blocked process lives.
             self.state["collector"]["status"] = "blocked"
@@ -72,7 +74,7 @@ class SensorCollector:
                 return self.pipe.recv()
             if not self.process.is_alive():
                 return {"error": "worker_exited"}
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(timing.SENSOR_WORKER_POLL)
         return {"error": "read_timeout"}
 
     async def run(self):
@@ -81,7 +83,7 @@ class SensorCollector:
             while not self.stopping:
                 if self.state["collector"]["status"] == "blocked":
                     if not await self.reap():
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(timing.SENSOR_BLOCKED_RETRY)
                         continue
                 self.state["collector"]["status"] = "running"
                 for s in self.state["sensors"]:
@@ -101,9 +103,11 @@ class SensorCollector:
                         log.warning("%s: %s", s["sensor_id"], s["error_code"])
                         if not await self.reap():
                             break
-                    delay = min(60, self.interval * 2 ** min(s["consecutive_failures"], 4))
+                    max_doublings = max(0, math.ceil(math.log2(timing.SENSOR_RETRY_MAX / self.interval)))
+                    delay = min(timing.SENSOR_RETRY_MAX,
+                                self.interval * 2 ** min(s["consecutive_failures"], max_doublings))
                     due[s["sensor_id"]] = time.monotonic() + delay
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(timing.SENSOR_LOOP_PAUSE)
         except asyncio.CancelledError:
             raise
         finally:
